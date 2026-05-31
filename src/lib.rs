@@ -29,4 +29,4 @@ pub mod quant;
 pub mod rope;
 pub mod sparse;
 
-pub use config::{AttnKind, Config};
+pub use config::Config;

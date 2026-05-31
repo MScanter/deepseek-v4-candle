@@ -5,15 +5,6 @@
 
 use serde::Deserialize;
 
-/// Per-layer attention variant, decided by `compress_ratios[layer]`:
-/// `0` → sliding-window, `4` → Compressed Sparse Attention, otherwise (`128`) → Heavily Compressed Attention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttnKind {
-    SlidingWindow,
-    Csa,
-    Hca,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub vocab_size: usize,
@@ -68,7 +59,10 @@ pub struct Config {
     #[serde(default = "default_eps")]
     pub norm_eps: f64,
 
-    /// Per-layer KV compression ratio; drives [`AttnKind`].
+    /// Per-layer KV compression ratio, selecting the attention variant for each layer:
+    /// `0` → sliding-window, `4` → Compressed Sparse Attention (CSA, with the learned indexer),
+    /// otherwise (e.g. `128`) → Heavily Compressed Attention (HCA). Mirrors the reference's
+    /// `if compress_ratio:` / `== 4` dispatch in `Attention.__init__`.
     pub compress_ratios: Vec<usize>,
 
     // Quantization (informational at the config level)
@@ -95,14 +89,5 @@ impl Config {
     /// (`hc` pre-weights + `hc` post-weights + an `hc × hc` combination matrix).
     pub fn mix_hc(&self) -> usize {
         (2 + self.hc_mult) * self.hc_mult
-    }
-
-    /// Attention variant for `layer`, per `compress_ratios`.
-    pub fn attention_kind(&self, layer: usize) -> AttnKind {
-        match self.compress_ratios[layer] {
-            0 => AttnKind::SlidingWindow,
-            4 => AttnKind::Csa,
-            _ => AttnKind::Hca,
-        }
     }
 }

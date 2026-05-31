@@ -142,7 +142,194 @@ pub fn toy_transformer(dev: &Device) -> candle_core::Result<Transformer> {
         embed: det_at(VOCAB, DIM, 800, dev)?,
         layers: vec![toy_block(dev)?],
         head: toy_head(dev)?,
-        rope: Rope::new(RD, 16, 0, 10000.0, 1.0, 32.0, 1.0, dev)?,
+        ropes: vec![Rope::new(RD, 16, 0, 10000.0, 1.0, 32.0, 1.0, dev)?],
         hc: HC,
     })
+}
+
+/// A 3-layer **hybrid** toy (sliding-window L0 + HCA L1 + CSA L2) with its own dims.
+///
+/// Distinct from the 1-layer toy above on purpose: `HD = 8`, `RD = 4` so the per-layer rope
+/// theta is *observable* — at `RD = 2` there is a single, theta-independent rope frequency, so a
+/// swapped window/compress rope would be invisible to a golden. Each layer's weights are offset by
+/// `L = layer * 1000`, so a misrouted layer (wrong rope, wrong block) diverges from the golden in
+/// `tests/fixtures/hybrid_golden.py`. Mirrors that golden's `layer_weights` / `head_weights`.
+pub mod hybrid {
+    use super::*;
+    use deepseek_v4_candle::sparse::{Compressor, Indexer};
+
+    pub const DIM: usize = 8;
+    pub const HC: usize = 2;
+    pub const H: usize = 2;
+    pub const HD: usize = 8; // head_dim (H*HD = 16, projected back to DIM by the grouped output)
+    pub const RD: usize = 4; // rope_head_dim (>1 frequency, so theta is observable)
+    pub const QLR: usize = 4;
+    pub const G: usize = 2;
+    pub const OLR: usize = 2;
+    pub const NROUTED: usize = 4;
+    pub const TOPK: usize = 2;
+    pub const INTER: usize = 4;
+    pub const MIXHC: usize = (2 + HC) * HC; // 8
+    pub const ITERS: usize = 20;
+    pub const VOCAB: usize = 6;
+    pub const IDXH: usize = 1; // indexer heads
+    pub const IDXHD: usize = 8; // indexer head_dim
+    pub const IDXTOPK: usize = 1; // blocks the indexer keeps per query
+    pub const WINDOW: usize = 128;
+    pub const MAXSEQ: usize = 16;
+    pub const ROPE_THETA: f64 = 10000.0; // sliding-window layers
+    pub const COMPRESS_ROPE_THETA: f64 = 160000.0; // HCA/CSA layers
+    pub const COMPRESS_RATIOS: [usize; 3] = [0, 2, 4];
+
+    /// KV compressor for the layer at offset `l`, ratio `ratio` (`coff = 2` overlap for CSA).
+    pub fn toy_compressor(ratio: usize, l: i64, dev: &Device) -> candle_core::Result<Compressor> {
+        let coff = if ratio == 4 { 2 } else { 1 };
+        Ok(Compressor {
+            wkv: det_at(coff * HD, DIM, l + 50, dev)?,
+            wgate: det_at(coff * HD, DIM, l + 60, dev)?,
+            ape: det_at(ratio, coff * HD, l + 70, dev)?,
+            norm: Tensor::ones((HD,), DType::F32, dev)?,
+            compress_ratio: ratio,
+            head_dim: HD,
+            rope_head_dim: RD,
+            eps: 1e-6,
+        })
+    }
+
+    /// CSA learned block selector for the layer at offset `l` (its own overlapping compressor).
+    pub fn toy_indexer(l: i64, dev: &Device) -> candle_core::Result<Indexer> {
+        Ok(Indexer {
+            wq_b: det_at(IDXH * IDXHD, QLR, l + 80, dev)?,
+            weights_proj: det_at(IDXH, DIM, l + 85, dev)?,
+            compressor: Compressor {
+                wkv: det_at(2 * IDXHD, DIM, l + 90, dev)?,
+                wgate: det_at(2 * IDXHD, DIM, l + 110, dev)?,
+                ape: det_at(4, 2 * IDXHD, l + 130, dev)?,
+                norm: Tensor::ones((IDXHD,), DType::F32, dev)?,
+                compress_ratio: 4,
+                head_dim: IDXHD,
+                rope_head_dim: RD,
+                eps: 1e-6,
+            },
+            n_heads: IDXH,
+            head_dim: IDXHD,
+            rope_head_dim: RD,
+            index_topk: IDXTOPK,
+            compress_ratio: 4,
+            scale: (IDXHD as f64).powf(-0.5),
+        })
+    }
+
+    /// MLA for the layer at offset `l`: window-only (`ratio 0`), HCA (`2`), or CSA (`4`).
+    pub fn toy_mla(ratio: usize, l: i64, dev: &Device) -> candle_core::Result<Mla> {
+        Ok(Mla {
+            wq_a: det_at(QLR, DIM, l + 1, dev)?,
+            q_norm: Tensor::ones((QLR,), DType::F32, dev)?,
+            wq_b: det_at(H * HD, QLR, l + 11, dev)?,
+            wkv: det_at(HD, DIM, l + 23, dev)?,
+            kv_norm: Tensor::ones((HD,), DType::F32, dev)?,
+            wo_a: det_at(G * OLR, (H * HD) / G, l + 31, dev)?,
+            wo_b: det_at(DIM, G * OLR, l + 43, dev)?,
+            attn_sink: det_at(1, H, l + 7, dev)?.reshape((H,))?,
+            n_heads: H,
+            head_dim: HD,
+            rope_head_dim: RD,
+            n_groups: G,
+            o_lora_rank: OLR,
+            window_size: WINDOW,
+            compress_ratio: ratio,
+            compressor: if ratio > 0 { Some(toy_compressor(ratio, l, dev)?) } else { None },
+            indexer: if ratio == 4 { Some(toy_indexer(l, dev)?) } else { None },
+            eps: 1e-6,
+            scale: (HD as f64).powf(-0.5),
+        })
+    }
+
+    /// MoE for the layer at offset `l` (4 routed experts top-2 + shared), per-layer weights.
+    pub fn toy_moe(l: i64, dev: &Device) -> candle_core::Result<Moe> {
+        let experts = (0..NROUTED)
+            .map(|j| {
+                let o = l + 100 + (j as i64) * 50;
+                Ok(Expert {
+                    w1: det_at(INTER, DIM, o, dev)?,
+                    w3: det_at(INTER, DIM, o + 20, dev)?,
+                    w2: det_at(DIM, INTER, o + 40, dev)?,
+                    swiglu_limit: 0.0,
+                })
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Ok(Moe {
+            gate: Gate {
+                weight: det_at(NROUTED, DIM, l + 300, dev)?,
+                bias: Some(det_at(1, NROUTED, l + 311, dev)?.reshape((NROUTED,))?),
+                topk: TOPK,
+                route_scale: 1.5,
+                score_func: ScoreFunc::SqrtSoftplus,
+            },
+            experts,
+            shared: Expert {
+                w1: det_at(INTER, DIM, l + 400, dev)?,
+                w3: det_at(INTER, DIM, l + 420, dev)?,
+                w2: det_at(DIM, INTER, l + 440, dev)?,
+                swiglu_limit: 0.0,
+            },
+        })
+    }
+
+    /// One Hyper-Connection mixer at weight offset `start` (base at `start + 97`).
+    pub fn toy_hc(start: i64, dev: &Device) -> candle_core::Result<Hc> {
+        Ok(Hc {
+            hc_fn: det_at(MIXHC, HC * DIM, start, dev)?,
+            hc_base: det_at(1, MIXHC, start + 97, dev)?.reshape((MIXHC,))?,
+            hc_scale: Tensor::new(&[1.0f32, 1.0, 1.0], dev)?,
+            hc: HC,
+            sinkhorn_iters: ITERS,
+            eps: 1e-6,
+            norm_eps: 1e-6,
+        })
+    }
+
+    /// Decoder block for `layer` (ratio from [`COMPRESS_RATIOS`]), weight offset `L = layer*1000`.
+    pub fn toy_block(layer: usize, dev: &Device) -> candle_core::Result<Block> {
+        let l = (layer as i64) * 1000;
+        Ok(Block {
+            attn: toy_mla(COMPRESS_RATIOS[layer], l, dev)?,
+            ffn: toy_moe(l, dev)?,
+            attn_norm: Tensor::ones((DIM,), DType::F32, dev)?,
+            ffn_norm: Tensor::ones((DIM,), DType::F32, dev)?,
+            hc_attn: toy_hc(l + 600, dev)?,
+            hc_ffn: toy_hc(l + 700, dev)?,
+            eps: 1e-6,
+        })
+    }
+
+    /// The parallel LM head (global — no layer offset).
+    pub fn toy_head(dev: &Device) -> candle_core::Result<Head> {
+        Ok(Head {
+            weight: det_at(VOCAB, DIM, 500, dev)?,
+            norm: Tensor::ones((DIM,), DType::F32, dev)?,
+            hc_fn: det_at(HC, HC * DIM, 520, dev)?,
+            hc_base: det_at(1, HC, 560, dev)?.reshape((HC,))?,
+            hc_scale: Tensor::new(&[1.0f32], dev)?,
+            hc: HC,
+            eps: 1e-6,
+            hc_eps: 1e-6,
+        })
+    }
+
+    /// The 3-layer hybrid toy [`Transformer`]: window (L0) + HCA (L1) + CSA (L2), per-layer ropes
+    /// (window theta vs compress theta). Assembled entirely by hand — the loader path is tested
+    /// separately against this same golden.
+    pub fn toy_transformer(dev: &Device) -> candle_core::Result<Transformer> {
+        let ropes = (0..COMPRESS_RATIOS.len())
+            .map(|layer| {
+                let theta = if COMPRESS_RATIOS[layer] > 0 { COMPRESS_ROPE_THETA } else { ROPE_THETA };
+                Rope::new(RD, MAXSEQ, 0, theta, 1.0, 32.0, 1.0, dev)
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let layers = (0..COMPRESS_RATIOS.len())
+            .map(|l| toy_block(l, dev))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Ok(Transformer { embed: det_at(VOCAB, DIM, 800, dev)?, layers, head: toy_head(dev)?, ropes, hc: HC })
+    }
 }

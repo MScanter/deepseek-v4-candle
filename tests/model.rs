@@ -18,6 +18,10 @@ use deepseek_v4_candle::model::{Head, Transformer};
 
 const TOY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/toy_config.json");
 const TOY_CKPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/toy_ckpt.safetensors");
+const TOY_HYBRID_CONFIG: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/toy_hybrid_config.json");
+const TOY_HYBRID_CKPT: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/toy_hybrid_ckpt.safetensors");
 
 /// `Head::forward` matches the pure-Python `ParallelHead` golden (b=1, s=3, hc=2, dim=4, vocab=5).
 ///
@@ -102,6 +106,32 @@ fn transformer_matches_reference() -> candle_core::Result<()> {
     Ok(())
 }
 
+/// 3-layer **hybrid** end-to-end parity (sliding-window L0 + HCA L1 + CSA L2): the hand-built
+/// `hybrid::toy_transformer` matches an independent pure-Python golden (`hybrid_golden.py`), which
+/// transcribes the reference HCA/CSA forward and the per-layer rope selection (window `rope_theta`
+/// vs `compress_rope_theta`) straight from `model.py`. This is the cross-check the per-unit
+/// attention goldens can't give: the compressor + learned indexer composed into a multi-layer stack
+/// with one rope regime per layer. A misrouted layer or a wrong block-selection path moves the
+/// logits by ~0.1+; the subtler per-layer-rope swap (compress theta → base theta) still shifts them
+/// ~3e-3 — both far above the ~1.5e-5 f32-vs-f64 bound (verified by perturbation).
+#[test]
+fn transformer_hybrid_matches_reference() -> candle_core::Result<()> {
+    let dev = Device::Cpu;
+    let model = common::hybrid::toy_transformer(&dev)?;
+    let input_ids = Tensor::from_vec(vec![1u32, 3, 0, 2, 4, 1, 5, 2], (1, 8), &dev)?;
+    let logits = model.forward(&input_ids, 0)?;
+    assert_eq!(logits.dims(), &[1, common::hybrid::VOCAB]);
+
+    let got = logits.flatten_all()?.to_vec1::<f32>()?;
+    let want = [-0.128011, -0.582537, -0.775581, -0.620491, -0.186882, 0.330612];
+    let max_d = got.iter().zip(want.iter()).map(|(g, w)| (g - w).abs()).fold(0.0, f32::max);
+    eprintln!("hybrid toy vs golden max|Δ|={max_d:e}");
+    for (g, w) in got.iter().zip(want.iter()) {
+        assert!((g - w).abs() < 1e-4, "hybrid logit {g} vs golden {w}");
+    }
+    Ok(())
+}
+
 /// `Transformer::from_config` loads the toy *converted* checkpoint (`make_toy_ckpt.py`: the real
 /// `convert.py` names, F32 values mirroring the `det_at` toy builders) and reproduces the SAME
 /// end-to-end golden as the hand-built `toy_transformer`. This is the real loader test: it proves
@@ -136,6 +166,46 @@ fn from_config_loads_and_matches_reference() -> candle_core::Result<()> {
     }
     for (g, t) in got.iter().zip(toy.iter()) {
         assert!((g - t).abs() < 1e-4, "from_config {g} vs toy_transformer {t}");
+    }
+    Ok(())
+}
+
+/// `Transformer::from_config` loads the 3-layer **hybrid** converted checkpoint
+/// (`make_toy_hybrid_ckpt.py`: window L0 + HCA L1 + CSA L2, the real `convert.py` names) and
+/// reproduces the SAME end-to-end golden as the hand-built `hybrid::toy_transformer`. This is the
+/// loader test for the compressed-attention path: it proves the compressor names
+/// (`…attn.compressor.{wkv,wgate,ape,norm}`) and the CSA indexer names
+/// (`…attn.indexer.{wq_b,weights_proj}` + the indexer's own `…indexer.compressor.*`) each land in
+/// the right field. A missing compressor/indexer collapses the layer to plain sliding-window and
+/// moves the logits by ~0.1+ — far above the ~1.5e-5 f32-vs-f64 bound.
+#[test]
+fn from_config_hybrid_matches_reference() -> candle_core::Result<()> {
+    let dev = Device::Cpu;
+    let cfg: Config = serde_json::from_str(&std::fs::read_to_string(TOY_HYBRID_CONFIG).unwrap())
+        .expect("parse toy_hybrid_config.json");
+    let st = SafeTensors::load(TOY_HYBRID_CKPT).expect("load toy_hybrid_ckpt.safetensors");
+    let model = Transformer::from_config(&cfg, &st, &dev)?;
+
+    let input_ids = Tensor::from_vec(vec![1u32, 3, 0, 2, 4, 1, 5, 2], (1, 8), &dev)?;
+    let got = model.forward(&input_ids, 0)?.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(got.len(), common::hybrid::VOCAB);
+
+    // Same golden as `transformer_hybrid_matches_reference` (hybrid_golden.py), plus a direct check
+    // against the validated hand-built hybrid model (isolating only f32 rounding of `det_at`).
+    let want = [-0.128011, -0.582537, -0.775581, -0.620491, -0.186882, 0.330612];
+    let toy = common::hybrid::toy_transformer(&dev)?
+        .forward(&input_ids, 0)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let max_g = got.iter().zip(want.iter()).map(|(g, w)| (g - w).abs()).fold(0.0, f32::max);
+    let max_t = got.iter().zip(toy.iter()).map(|(g, t)| (g - t).abs()).fold(0.0, f32::max);
+    eprintln!("hybrid from_config vs golden max|Δ|={max_g:e}; vs hand-built max|Δ|={max_t:e}");
+
+    for (g, w) in got.iter().zip(want.iter()) {
+        assert!((g - w).abs() < 1e-4, "hybrid from_config logit {g} vs golden {w}");
+    }
+    for (g, t) in got.iter().zip(toy.iter()) {
+        assert!((g - t).abs() < 1e-4, "hybrid from_config {g} vs hand-built {t}");
     }
     Ok(())
 }

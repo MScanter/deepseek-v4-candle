@@ -16,11 +16,12 @@
 
 use crate::attention::{linear, rms_norm, Mla};
 use crate::block::Block;
-use crate::config::{AttnKind, Config};
+use crate::config::Config;
 use crate::loader::SafeTensors;
 use crate::mhc::Hc;
 use crate::moe::{Expert, Gate, Moe, ScoreFunc};
 use crate::rope::Rope;
+use crate::sparse::{Compressor, Indexer};
 use candle_core::{DType, Device, Error, Result, Tensor};
 
 /// Numerically stable sigmoid: `1 / (1 + e^-x)` (affine(1,1) turns `e^-x` into `e^-x + 1`).
@@ -85,8 +86,11 @@ pub struct Transformer {
     pub layers: Vec<Block>,
     /// Parallel LM head.
     pub head: Head,
-    /// Shared YaRN rotary embeddings.
-    pub rope: Rope,
+    /// Per-layer YaRN rotary embeddings — one [`Rope`] per layer, since a compressed
+    /// (HCA/CSA) layer uses `compress_rope_theta` + YaRN while a sliding-window layer uses
+    /// the base `rope_theta` with YaRN disabled (`Attention.__init__`, model.py 475-482).
+    /// `ropes[l]` is shared within layer `l` by the main q/kv, the compressor, and the indexer.
+    pub ropes: Vec<Rope>,
     /// Number of residual streams (`hc_mult`).
     pub hc: usize,
 }
@@ -105,33 +109,16 @@ impl Transformer {
                 cfg.n_hash_layers
             )));
         }
-        // Only sliding-window layers are assembled so far; a compressed (HCA/CSA) layer needs its KV
-        // compressor (+ the CSA indexer), which `build_mla` does not yet load. Fail loudly on them.
-        for l in 0..cfg.n_layers {
-            let kind = cfg.attention_kind(l);
-            if kind != AttnKind::SlidingWindow {
-                return Err(Error::Msg(format!(
-                    "from_config: layer {l} is {kind:?}; only sliding-window layers are built so far (HCA/CSA loading is deferred)"
-                )));
-            }
-        }
 
         let embed = st.auto_tensor("embed.weight", &[cfg.vocab_size, cfg.dim], dev)?;
         let layers = (0..cfg.n_layers)
             .map(|l| build_block(cfg, st, l, dev))
             .collect::<Result<Vec<_>>>()?;
         let head = build_head(cfg, st, dev)?;
-        let rope = Rope::new(
-            cfg.rope_head_dim,
-            cfg.max_seq_len,
-            0,
-            cfg.rope_theta,
-            cfg.rope_factor,
-            cfg.beta_fast,
-            cfg.beta_slow,
-            dev,
-        )?;
-        Ok(Self { embed, layers, head, rope, hc: cfg.hc_mult })
+        let ropes = (0..cfg.n_layers)
+            .map(|l| build_rope(cfg, l, dev))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { embed, layers, head, ropes, hc: cfg.hc_mult })
     }
 
     /// `input_ids`: `[b, s]` (integer ids) → logits `[b, vocab]` (last position).
@@ -144,8 +131,8 @@ impl Transformer {
         let h = self.embed.index_select(&ids, 0)?.reshape((b, s, dim))?; // [b, s, dim]
         let mut h = h.unsqueeze(2)?.broadcast_as((b, s, self.hc, dim))?.contiguous()?;
 
-        for layer in &self.layers {
-            h = layer.forward(&h, &self.rope, start_pos)?; // [b, s, hc, dim]
+        for (l, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(&h, &self.ropes[l], start_pos)?; // [b, s, hc, dim]
         }
         self.head.forward(&h) // [b, vocab]
     }
@@ -156,6 +143,28 @@ impl Transformer {
 // Each loads one sub-module from the checkpoint. Projection weights go through [`SafeTensors::linear`]
 // (FP8/FP4 when a `.scale` sibling is present, else the unquantized weight by dtype); norms, biases,
 // `attn_sink`, and the hc params — never quantized — go through [`SafeTensors::auto_tensor`].
+
+/// The YaRN [`Rope`] for layer `layer`, picking the base/YaRN regime by compression ratio
+/// (`Attention.__init__`, model.py 475-482): a sliding-window layer (`compress_ratio == 0`)
+/// disables YaRN (`original_seq_len = 0`) and uses the base `rope_theta`; a compressed (HCA/CSA)
+/// layer enables YaRN over `original_seq_len` and uses `compress_rope_theta`.
+fn build_rope(cfg: &Config, layer: usize, dev: &Device) -> Result<Rope> {
+    let (original_seq_len, theta) = if cfg.compress_ratios[layer] != 0 {
+        (cfg.original_seq_len, cfg.compress_rope_theta)
+    } else {
+        (0, cfg.rope_theta)
+    };
+    Rope::new(
+        cfg.rope_head_dim,
+        cfg.max_seq_len,
+        original_seq_len,
+        theta,
+        cfg.rope_factor,
+        cfg.beta_fast,
+        cfg.beta_slow,
+        dev,
+    )
+}
 
 /// Map the config's `score_func` string to the [`ScoreFunc`] enum.
 fn score_func(name: &str) -> Result<ScoreFunc> {
@@ -168,9 +177,12 @@ fn score_func(name: &str) -> Result<ScoreFunc> {
 }
 
 /// One [`Mla`] (layer `layer`). `wq_a/wq_b/wkv/wo_b` are FP8 in a real checkpoint; `wo_a` is the
-/// pre-dequantized bf16 special-case (no scale) — `linear` handles both by scale presence.
+/// pre-dequantized bf16 special-case (no scale) — `linear` handles both by scale presence. A
+/// compressed layer (`compress_ratio > 0`) also carries a KV [`Compressor`]; a CSA layer
+/// (`compress_ratio == 4`) additionally carries the learned [`Indexer`].
 fn build_mla(cfg: &Config, st: &SafeTensors, layer: usize, dev: &Device) -> Result<Mla> {
     let p = format!("layers.{layer}.attn");
+    let ratio = cfg.compress_ratios[layer];
     Ok(Mla {
         wq_a: st.linear(&format!("{p}.wq_a"), cfg.q_lora_rank, cfg.dim, false, dev)?,
         q_norm: st.auto_tensor(&format!("{p}.q_norm.weight"), &[cfg.q_lora_rank], dev)?,
@@ -192,11 +204,60 @@ fn build_mla(cfg: &Config, st: &SafeTensors, layer: usize, dev: &Device) -> Resu
         n_groups: cfg.o_groups,
         o_lora_rank: cfg.o_lora_rank,
         window_size: cfg.window_size,
-        compress_ratio: cfg.compress_ratios[layer],
-        compressor: None,
-        indexer: None,
+        compress_ratio: ratio,
+        compressor: if ratio > 0 {
+            Some(build_compressor(&format!("{p}.compressor"), ratio, cfg.head_dim, cfg, st, dev)?)
+        } else {
+            None
+        },
+        indexer: if ratio == 4 { Some(build_indexer(&p, cfg, st, dev)?) } else { None },
         eps: cfg.norm_eps,
         scale: (cfg.head_dim as f64).powf(-0.5),
+    })
+}
+
+/// One KV [`Compressor`] at `prefix` (`layers.N.attn.compressor` for the main path, or
+/// `layers.N.attn.indexer.compressor` for the CSA indexer's own). `coff = 2` for the CSA overlap
+/// (`ratio == 4`), else `1`; `wkv`/`wgate` are stored bf16 (no `.scale` → `linear` reads them
+/// unquantized), `ape` is an fp32 `nn.Parameter` (no `.weight`), `norm` is the RMSNorm gamma.
+/// `rope_head_dim` is the *global* `cfg.rope_head_dim` regardless of `head_dim` (model.py 287).
+fn build_compressor(
+    prefix: &str,
+    ratio: usize,
+    head_dim: usize,
+    cfg: &Config,
+    st: &SafeTensors,
+    dev: &Device,
+) -> Result<Compressor> {
+    let coff = if ratio == 4 { 2 } else { 1 };
+    Ok(Compressor {
+        wkv: st.linear(&format!("{prefix}.wkv"), coff * head_dim, cfg.dim, false, dev)?,
+        wgate: st.linear(&format!("{prefix}.wgate"), coff * head_dim, cfg.dim, false, dev)?,
+        ape: st.auto_tensor(&format!("{prefix}.ape"), &[ratio, coff * head_dim], dev)?,
+        norm: st.auto_tensor(&format!("{prefix}.norm.weight"), &[head_dim], dev)?,
+        compress_ratio: ratio,
+        head_dim,
+        rope_head_dim: cfg.rope_head_dim,
+        eps: cfg.norm_eps,
+    })
+}
+
+/// The CSA learned [`Indexer`] for the layer attention at `p` (`layers.N.attn`). Its query proj
+/// `wq_b` and per-head `weights_proj` are bf16; it owns an overlapping [`Compressor`] at
+/// `index_head_dim` (always `ratio == 4`). The per-head weight is scaled by `n_heads^-0.5` inside
+/// `select`, so `scale` here is just `index_head_dim^-0.5`.
+fn build_indexer(p: &str, cfg: &Config, st: &SafeTensors, dev: &Device) -> Result<Indexer> {
+    let (ih, ihd) = (cfg.index_n_heads, cfg.index_head_dim);
+    Ok(Indexer {
+        wq_b: st.linear(&format!("{p}.indexer.wq_b"), ih * ihd, cfg.q_lora_rank, false, dev)?,
+        weights_proj: st.linear(&format!("{p}.indexer.weights_proj"), ih, cfg.dim, false, dev)?,
+        compressor: build_compressor(&format!("{p}.indexer.compressor"), 4, ihd, cfg, st, dev)?,
+        n_heads: ih,
+        head_dim: ihd,
+        rope_head_dim: cfg.rope_head_dim,
+        index_topk: cfg.index_topk,
+        compress_ratio: 4,
+        scale: (ihd as f64).powf(-0.5),
     })
 }
 

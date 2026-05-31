@@ -139,7 +139,7 @@ fn main() -> Result<()> {
         embed: det(&dev, VOCAB, DIM, 800)?,
         layers: vec![block],
         head,
-        rope: Rope::new(RD, 16, 0, 10000.0, 1.0, 32.0, 1.0, &dev)?,
+        ropes: vec![Rope::new(RD, 16, 0, 10000.0, 1.0, 32.0, 1.0, &dev)?],
         hc: HC,
     };
 

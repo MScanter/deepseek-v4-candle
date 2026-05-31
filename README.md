@@ -31,13 +31,14 @@ built here from scratch and pinned to a golden:
   of the reference formula, *not* from this Rust code, so a green test is genuine cross-checking.
   (torch / CUDA are unavailable in the dev environment, which forces this independence.)
 - **End-to-end parity** — the assembled forward pass (embed → mHC block → parallel head) matches a
-  pure-Python golden to `max |Δ| ≈ 1e-5`.
-- **57 tests**, `clippy` clean.
+  pure-Python golden to `max |Δ| ≈ 1e-5`, for both a 1-layer model and a 3-layer hybrid stack
+  exercising all three attention regimes (sliding-window + HCA + CSA) with per-layer RoPE.
+- **59 tests**, `clippy` clean.
 
 ## Quick start
 
 ```bash
-cargo test                       # 57 tests (unit goldens + end-to-end parity)
+cargo test                       # 59 tests (unit goldens + end-to-end parity)
 cargo run --example toy_forward  # tiny end-to-end forward pass, prints next-token logits
 ```
 
@@ -63,11 +64,12 @@ An *architecture* reference, validated at toy scale — and honest about what it
   end-to-end.
 - ✅ **Checkpoint loader** — `Transformer::from_config` assembles the model straight from a converted
   `safetensors` checkpoint, reading every weight by the name `convert.py` emits and dequantizing the
-  FP8/FP4 projections as it goes. Pinned on synthetic fixtures (one per dtype branch) and a toy
-  converted checkpoint — a 1-layer sliding-window model reproducing its end-to-end golden, proof
-  every name lands in the right field across the whole stack. Compressed-attention (HCA/CSA) and
-  hash-routing layers are deferred — `from_config` errors *explicitly* on them — so it does not yet
-  assemble the full 284B model, which needs ~150–300 GB regardless, past dev hardware.
+  FP8/FP4 projections as it goes. Pinned on synthetic fixtures (one per dtype branch) and two toy
+  converted checkpoints — a 1-layer sliding-window model and a 3-layer hybrid (window + HCA + CSA) —
+  each reproducing its end-to-end golden, proof every name lands in the right field, down to the
+  per-layer `Compressor` and CSA `Indexer` (and the indexer's own nested compressor). Hash-routing
+  layers are the one deferred path — it errors *explicitly* there (`tid2eid` loading not yet wired) —
+  so it does not yet assemble the full 284B model, which needs ~150–300 GB regardless, past dev hardware.
 - ⛔ No tokenizer yet — inputs are raw token ids.
 - ⛔ Prefill only — no decode-phase KV cache (`start_pos > 0`).
 - ⛔ Single-rank — tensor-parallel sharding collapses to identity.
