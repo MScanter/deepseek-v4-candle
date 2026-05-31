@@ -1,0 +1,13 @@
+[package]
+name = "deepseek-v4-candle"
+version = "0.1.0"
+edition = "2021"
+description = "A reference implementation of the DeepSeek-V4 architecture (CSA/HCA hybrid attention, mHC, FP4/FP8) in Rust + candle. Parity-tested at toy scale."
+license = "MIT"
+
+[dependencies]
+candle-core = "0.9"
+candle-nn = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
