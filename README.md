@@ -32,12 +32,12 @@ built here from scratch and pinned to a golden:
   (torch / CUDA are unavailable in the dev environment, which forces this independence.)
 - **End-to-end parity** — the assembled forward pass (embed → mHC block → parallel head) matches a
   pure-Python golden to `max |Δ| ≈ 1e-5`.
-- **44 tests**, `clippy` clean.
+- **57 tests**, `clippy` clean.
 
 ## Quick start
 
 ```bash
-cargo test                       # 44 tests (unit goldens + end-to-end parity)
+cargo test                       # 57 tests (unit goldens + end-to-end parity)
 cargo run --example toy_forward  # tiny end-to-end forward pass, prints next-token logits
 ```
 
@@ -53,6 +53,7 @@ cargo run --example toy_forward  # tiny end-to-end forward pass, prints next-tok
 | `block` | one decoder layer: mHC-wrapped attention + MoE |
 | `model` | embedding + stacked blocks + parallel LM head (full forward) |
 | `quant` | FP4 / FP8 / UE8M0 → f32 weight dequant |
+| `loader` | `safetensors` mmap reader → typed weight load (FP8/FP4 via `quant`, BF16/F32 direct); `Transformer::from_config` assembles the model |
 
 ## Scope & limitations
 
@@ -60,7 +61,14 @@ An *architecture* reference, validated at toy scale — and honest about what it
 
 - ✅ Numerically faithful forward pass for every novel component, parity-pinned per unit and
   end-to-end.
-- ⛔ No checkpoint loader or tokenizer yet — the toy model uses deterministic weights.
+- ✅ **Checkpoint loader** — `Transformer::from_config` assembles the model straight from a converted
+  `safetensors` checkpoint, reading every weight by the name `convert.py` emits and dequantizing the
+  FP8/FP4 projections as it goes. Pinned on synthetic fixtures (one per dtype branch) and a toy
+  converted checkpoint — a 1-layer sliding-window model reproducing its end-to-end golden, proof
+  every name lands in the right field across the whole stack. Compressed-attention (HCA/CSA) and
+  hash-routing layers are deferred — `from_config` errors *explicitly* on them — so it does not yet
+  assemble the full 284B model, which needs ~150–300 GB regardless, past dev hardware.
+- ⛔ No tokenizer yet — inputs are raw token ids.
 - ⛔ Prefill only — no decode-phase KV cache (`start_pos > 0`).
 - ⛔ Single-rank — tensor-parallel sharding collapses to identity.
 - ⛔ Weights are decoded to f32 and fed the standard f32 `linear`. The reference's fused

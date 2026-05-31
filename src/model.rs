@@ -14,10 +14,14 @@
 //! `part_vocab_size` splits + `all_gather`) collapses to the identity here. Hash-routing
 //! MoE layers (which need `input_ids`) are deferred — every block here routes by score.
 
-use crate::attention::{linear, rms_norm};
+use crate::attention::{linear, rms_norm, Mla};
 use crate::block::Block;
+use crate::config::{AttnKind, Config};
+use crate::loader::SafeTensors;
+use crate::mhc::Hc;
+use crate::moe::{Expert, Gate, Moe, ScoreFunc};
 use crate::rope::Rope;
-use candle_core::{DType, Result, Tensor};
+use candle_core::{DType, Device, Error, Result, Tensor};
 
 /// Numerically stable sigmoid: `1 / (1 + e^-x)` (affine(1,1) turns `e^-x` into `e^-x + 1`).
 fn sigmoid(x: &Tensor) -> Result<Tensor> {
@@ -88,6 +92,48 @@ pub struct Transformer {
 }
 
 impl Transformer {
+    /// Assemble a [`Transformer`] from a [`Config`] and a loaded converted checkpoint, reading each
+    /// weight by the name `inference/convert.py` emits (the inference model's attribute path) and the
+    /// dtype the architecture stores it as (FP8/FP4 for the projections, bf16/f32 for the rest).
+    pub fn from_config(cfg: &Config, st: &SafeTensors, dev: &Device) -> Result<Self> {
+        // Scope guards — fail loudly on the paths not yet wired (consistent with the forward-path
+        // deferrals). Hash-routed layers need the `tid2eid` table; HCA/CSA layers need the
+        // compressor (+ indexer for CSA). Both are documented gaps, not silent wrong answers.
+        if cfg.n_hash_layers > 0 {
+            return Err(Error::Msg(format!(
+                "from_config: hash-routing layers (n_hash_layers={}) not yet supported — Gate.route_hashed / tid2eid loading is deferred",
+                cfg.n_hash_layers
+            )));
+        }
+        // Only sliding-window layers are assembled so far; a compressed (HCA/CSA) layer needs its KV
+        // compressor (+ the CSA indexer), which `build_mla` does not yet load. Fail loudly on them.
+        for l in 0..cfg.n_layers {
+            let kind = cfg.attention_kind(l);
+            if kind != AttnKind::SlidingWindow {
+                return Err(Error::Msg(format!(
+                    "from_config: layer {l} is {kind:?}; only sliding-window layers are built so far (HCA/CSA loading is deferred)"
+                )));
+            }
+        }
+
+        let embed = st.auto_tensor("embed.weight", &[cfg.vocab_size, cfg.dim], dev)?;
+        let layers = (0..cfg.n_layers)
+            .map(|l| build_block(cfg, st, l, dev))
+            .collect::<Result<Vec<_>>>()?;
+        let head = build_head(cfg, st, dev)?;
+        let rope = Rope::new(
+            cfg.rope_head_dim,
+            cfg.max_seq_len,
+            0,
+            cfg.rope_theta,
+            cfg.rope_factor,
+            cfg.beta_fast,
+            cfg.beta_slow,
+            dev,
+        )?;
+        Ok(Self { embed, layers, head, rope, hc: cfg.hc_mult })
+    }
+
     /// `input_ids`: `[b, s]` (integer ids) → logits `[b, vocab]` (last position).
     pub fn forward(&self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
         let (b, s) = input_ids.dims2()?;
@@ -103,4 +149,122 @@ impl Transformer {
         }
         self.head.forward(&h) // [b, vocab]
     }
+}
+
+// --- `from_config` builders --------------------------------------------------------------------
+//
+// Each loads one sub-module from the checkpoint. Projection weights go through [`SafeTensors::linear`]
+// (FP8/FP4 when a `.scale` sibling is present, else the unquantized weight by dtype); norms, biases,
+// `attn_sink`, and the hc params — never quantized — go through [`SafeTensors::auto_tensor`].
+
+/// Map the config's `score_func` string to the [`ScoreFunc`] enum.
+fn score_func(name: &str) -> Result<ScoreFunc> {
+    match name {
+        "sqrtsoftplus" => Ok(ScoreFunc::SqrtSoftplus),
+        "softmax" => Ok(ScoreFunc::Softmax),
+        "sigmoid" => Ok(ScoreFunc::Sigmoid),
+        other => Err(Error::Msg(format!("from_config: unknown score_func {other:?}"))),
+    }
+}
+
+/// One [`Mla`] (layer `layer`). `wq_a/wq_b/wkv/wo_b` are FP8 in a real checkpoint; `wo_a` is the
+/// pre-dequantized bf16 special-case (no scale) — `linear` handles both by scale presence.
+fn build_mla(cfg: &Config, st: &SafeTensors, layer: usize, dev: &Device) -> Result<Mla> {
+    let p = format!("layers.{layer}.attn");
+    Ok(Mla {
+        wq_a: st.linear(&format!("{p}.wq_a"), cfg.q_lora_rank, cfg.dim, false, dev)?,
+        q_norm: st.auto_tensor(&format!("{p}.q_norm.weight"), &[cfg.q_lora_rank], dev)?,
+        wq_b: st.linear(&format!("{p}.wq_b"), cfg.n_heads * cfg.head_dim, cfg.q_lora_rank, false, dev)?,
+        wkv: st.linear(&format!("{p}.wkv"), cfg.head_dim, cfg.dim, false, dev)?,
+        kv_norm: st.auto_tensor(&format!("{p}.kv_norm.weight"), &[cfg.head_dim], dev)?,
+        wo_a: st.linear(
+            &format!("{p}.wo_a"),
+            cfg.o_groups * cfg.o_lora_rank,
+            cfg.n_heads * cfg.head_dim / cfg.o_groups,
+            false,
+            dev,
+        )?,
+        wo_b: st.linear(&format!("{p}.wo_b"), cfg.dim, cfg.o_groups * cfg.o_lora_rank, false, dev)?,
+        attn_sink: st.auto_tensor(&format!("{p}.attn_sink"), &[cfg.n_heads], dev)?,
+        n_heads: cfg.n_heads,
+        head_dim: cfg.head_dim,
+        rope_head_dim: cfg.rope_head_dim,
+        n_groups: cfg.o_groups,
+        o_lora_rank: cfg.o_lora_rank,
+        window_size: cfg.window_size,
+        compress_ratio: cfg.compress_ratios[layer],
+        compressor: None,
+        indexer: None,
+        eps: cfg.norm_eps,
+        scale: (cfg.head_dim as f64).powf(-0.5),
+    })
+}
+
+/// One SwiGLU [`Expert`]. `fp4` selects the FP4 dequant for routed experts (shared experts are FP8).
+fn build_expert(prefix: &str, cfg: &Config, st: &SafeTensors, fp4: bool, dev: &Device) -> Result<Expert> {
+    Ok(Expert {
+        w1: st.linear(&format!("{prefix}.w1"), cfg.moe_inter_dim, cfg.dim, fp4, dev)?,
+        w2: st.linear(&format!("{prefix}.w2"), cfg.dim, cfg.moe_inter_dim, fp4, dev)?,
+        w3: st.linear(&format!("{prefix}.w3"), cfg.moe_inter_dim, cfg.dim, fp4, dev)?,
+        swiglu_limit: cfg.swiglu_limit,
+    })
+}
+
+/// The [`Moe`] for layer `layer`: routed experts (FP4), the FP8 shared expert, and the gate.
+fn build_moe(cfg: &Config, st: &SafeTensors, layer: usize, dev: &Device) -> Result<Moe> {
+    let p = format!("layers.{layer}.ffn");
+    let experts = (0..cfg.n_routed_experts)
+        .map(|j| build_expert(&format!("{p}.experts.{j}"), cfg, st, true, dev))
+        .collect::<Result<Vec<_>>>()?;
+    let shared = build_expert(&format!("{p}.shared_experts"), cfg, st, false, dev)?;
+    let gate = Gate {
+        weight: st.linear(&format!("{p}.gate"), cfg.n_routed_experts, cfg.dim, false, dev)?,
+        bias: Some(st.auto_tensor(&format!("{p}.gate.bias"), &[cfg.n_routed_experts], dev)?),
+        topk: cfg.n_activated_experts,
+        route_scale: cfg.route_scale,
+        score_func: score_func(&cfg.score_func)?,
+    };
+    Ok(Moe { gate, experts, shared })
+}
+
+/// One [`Hc`] mixer. `prefix` is the site stem (`layers.N.hc_attn` / `layers.N.hc_ffn`); the three
+/// params are `{prefix}_fn` `[mix_hc, hc*dim]`, `{prefix}_base` `[mix_hc]`, `{prefix}_scale` `[3]`.
+fn build_hc(prefix: &str, cfg: &Config, st: &SafeTensors, dev: &Device) -> Result<Hc> {
+    Ok(Hc {
+        hc_fn: st.auto_tensor(&format!("{prefix}_fn"), &[cfg.mix_hc(), cfg.hc_mult * cfg.dim], dev)?,
+        hc_base: st.auto_tensor(&format!("{prefix}_base"), &[cfg.mix_hc()], dev)?,
+        hc_scale: st.auto_tensor(&format!("{prefix}_scale"), &[3], dev)?,
+        hc: cfg.hc_mult,
+        sinkhorn_iters: cfg.hc_sinkhorn_iters,
+        eps: cfg.hc_eps,
+        norm_eps: cfg.norm_eps,
+    })
+}
+
+/// One decoder [`Block`]: mHC-wrapped attention + MoE, with the two pre-sublayer RMSNorms.
+fn build_block(cfg: &Config, st: &SafeTensors, layer: usize, dev: &Device) -> Result<Block> {
+    Ok(Block {
+        attn: build_mla(cfg, st, layer, dev)?,
+        ffn: build_moe(cfg, st, layer, dev)?,
+        attn_norm: st.auto_tensor(&format!("layers.{layer}.attn_norm.weight"), &[cfg.dim], dev)?,
+        ffn_norm: st.auto_tensor(&format!("layers.{layer}.ffn_norm.weight"), &[cfg.dim], dev)?,
+        hc_attn: build_hc(&format!("layers.{layer}.hc_attn"), cfg, st, dev)?,
+        hc_ffn: build_hc(&format!("layers.{layer}.hc_ffn"), cfg, st, dev)?,
+        eps: cfg.norm_eps,
+    })
+}
+
+/// The LM [`Head`]: it consolidates the reference's top-level `head` (bf16, no scale), final `norm`,
+/// and head mHC params (`hc_head_{fn,base,scale}`, `hc_head_scale` is `[1]`) into one struct.
+fn build_head(cfg: &Config, st: &SafeTensors, dev: &Device) -> Result<Head> {
+    Ok(Head {
+        weight: st.linear("head", cfg.vocab_size, cfg.dim, false, dev)?,
+        norm: st.auto_tensor("norm.weight", &[cfg.dim], dev)?,
+        hc_fn: st.auto_tensor("hc_head_fn", &[cfg.hc_mult, cfg.hc_mult * cfg.dim], dev)?,
+        hc_base: st.auto_tensor("hc_head_base", &[cfg.hc_mult], dev)?,
+        hc_scale: st.auto_tensor("hc_head_scale", &[1], dev)?,
+        hc: cfg.hc_mult,
+        eps: cfg.norm_eps,
+        hc_eps: cfg.hc_eps,
+    })
 }

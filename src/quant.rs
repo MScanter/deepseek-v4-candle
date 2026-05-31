@@ -67,6 +67,14 @@ pub fn e8m0_decode(byte: u8) -> f32 {
     }
 }
 
+/// Decode one `bf16` value (its raw 16 bits) to f32. `bf16` is exactly the high 16 bits of an
+/// IEEE-754 f32 (same sign + 8-bit exponent, mantissa truncated to 7 bits), so widening is a
+/// left-shift into place — lossless in this direction. The converted checkpoint stores `wo_a` and
+/// every norm/bias as `bf16`, so the loader needs this.
+pub fn bf16_decode(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 /// Dequantize an FP8 (`e4m3`) weight `[rows, cols]` with an `e8m0` scale `[⌈rows/block⌉, ⌈cols/block⌉]`
 /// (one scale per `block`×`block` tile) into an f32 `[rows, cols]` tensor.
 pub fn fp8_weight_dequant(

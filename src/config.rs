@@ -41,6 +41,10 @@ pub struct Config {
     pub o_groups: usize,
     pub o_lora_rank: usize,
     pub window_size: usize,
+    /// Maximum sequence length — sizes the RoPE precompute table. The reference keeps this as a
+    /// `ModelArgs` field (default 4096) rather than in `config.json`, so it defaults here too.
+    #[serde(default = "default_max_seq_len")]
+    pub max_seq_len: usize,
 
     // YaRN rope
     pub original_seq_len: usize,
@@ -78,6 +82,9 @@ pub struct Config {
 
 fn default_mtp_layers() -> usize {
     1
+}
+fn default_max_seq_len() -> usize {
+    4096
 }
 fn default_eps() -> f64 {
     1e-6

@@ -15,11 +15,13 @@
 //! - [`moe`]      — Mixture-of-Experts gate (`sqrtsoftplus` routing), SwiGLU experts, combine.
 //! - [`block`]    — one decoder layer: mHC-wrapped attention + MoE.
 //! - [`model`]    — embedding + stacked blocks + parallel LM head (full forward).
-//! - [`quant`]    — FP4/FP8 → f32 weight dequant (load real checkpoints).
+//! - [`quant`]    — FP4/FP8/BF16 → f32 weight dequant.
+//! - [`loader`]   — minimal safetensors reader + typed dequant to load a converted checkpoint.
 
 pub mod attention;
 pub mod block;
 pub mod config;
+pub mod loader;
 pub mod mhc;
 pub mod model;
 pub mod moe;

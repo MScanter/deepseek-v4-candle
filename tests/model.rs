@@ -12,7 +12,12 @@ mod common;
 use common::*;
 
 use candle_core::{Device, Tensor};
-use deepseek_v4_candle::model::Head;
+use deepseek_v4_candle::config::Config;
+use deepseek_v4_candle::loader::SafeTensors;
+use deepseek_v4_candle::model::{Head, Transformer};
+
+const TOY_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/toy_config.json");
+const TOY_CKPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/toy_ckpt.safetensors");
 
 /// `Head::forward` matches the pure-Python `ParallelHead` golden (b=1, s=3, hc=2, dim=4, vocab=5).
 ///
@@ -93,6 +98,44 @@ fn transformer_matches_reference() -> candle_core::Result<()> {
     let want = [0.48474, -0.635526, -1.470525, -1.645452, -1.081788, -0.032544];
     for (g, w) in got.iter().zip(want.iter()) {
         assert!((g - w).abs() < 1e-4, "transformer logit {g} vs golden {w}");
+    }
+    Ok(())
+}
+
+/// `Transformer::from_config` loads the toy *converted* checkpoint (`make_toy_ckpt.py`: the real
+/// `convert.py` names, F32 values mirroring the `det_at` toy builders) and reproduces the SAME
+/// end-to-end golden as the hand-built `toy_transformer`. This is the real loader test: it proves
+/// every checkpoint name lands in the right field across the whole stack (a single misrouted weight
+/// moves the logits by ~0.1+). The values are stored F32/no-scale, so this exercises the
+/// `auto_tensor`/`linear` plumbing; the FP8/FP4 dequant branches are pinned in the loader tests.
+#[test]
+fn from_config_loads_and_matches_reference() -> candle_core::Result<()> {
+    let dev = Device::Cpu;
+    let cfg: Config = serde_json::from_str(&std::fs::read_to_string(TOY_CONFIG).unwrap())
+        .expect("parse toy_config.json");
+    let st = SafeTensors::load(TOY_CKPT).expect("load toy_ckpt.safetensors");
+    let model = Transformer::from_config(&cfg, &st, &dev)?;
+
+    let input_ids = Tensor::from_vec(vec![1u32, 3, 0, 2], (1, 4), &dev)?;
+    let got = model.forward(&input_ids, 0)?.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(got.len(), VOCAB);
+
+    // Same golden as `transformer_matches_reference`, plus a direct check against the validated
+    // hand-built model (which isolates the only expected difference: f32 rounding of `det_at`).
+    let want = [0.48474, -0.635526, -1.470525, -1.645452, -1.081788, -0.032544];
+    let toy = toy_transformer(&dev)?
+        .forward(&input_ids, 0)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let max_g = got.iter().zip(want.iter()).map(|(g, w)| (g - w).abs()).fold(0.0, f32::max);
+    let max_t = got.iter().zip(toy.iter()).map(|(g, t)| (g - t).abs()).fold(0.0, f32::max);
+    eprintln!("from_config vs golden max|Δ|={max_g:e}; vs toy_transformer max|Δ|={max_t:e}");
+
+    for (g, w) in got.iter().zip(want.iter()) {
+        assert!((g - w).abs() < 1e-4, "from_config logit {g} vs golden {w}");
+    }
+    for (g, t) in got.iter().zip(toy.iter()) {
+        assert!((g - t).abs() < 1e-4, "from_config {g} vs toy_transformer {t}");
     }
     Ok(())
 }

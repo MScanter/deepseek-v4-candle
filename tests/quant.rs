@@ -7,7 +7,7 @@
 
 use candle_core::Device;
 use deepseek_v4_candle::quant::{
-    e2m1_decode, e4m3_decode, e8m0_decode, fp4_weight_dequant, fp8_weight_dequant,
+    bf16_decode, e2m1_decode, e4m3_decode, e8m0_decode, fp4_weight_dequant, fp8_weight_dequant,
 };
 
 /// `e2m1` — all 16 nibbles. Magnitudes `{0,.5,1,1.5,2,3,4,6}` for bits 0-2; bit 3 is the sign.
@@ -43,6 +43,19 @@ fn e8m0_decodes_powers_of_two() {
     assert_eq!(e8m0_decode(0x81), 4.0); // 2^2
     assert_eq!(e8m0_decode(0x7E), 0.5); // 2^-1
     assert!(e8m0_decode(0xFF).is_nan());
+}
+
+/// `bf16` — the high 16 bits of an f32, so `bits << 16` reinterpreted as f32. Spot values cover
+/// 1.0/2.0/0.5, both signs, and a rounded π to pin mantissa placement.
+#[test]
+fn bf16_decodes_known_bytes() {
+    assert_eq!(bf16_decode(0x0000), 0.0);
+    assert_eq!(bf16_decode(0x3F80), 1.0);
+    assert_eq!(bf16_decode(0x4000), 2.0);
+    assert_eq!(bf16_decode(0x3F00), 0.5);
+    assert_eq!(bf16_decode(0xBF80), -1.0);
+    assert_eq!(bf16_decode(0xC000), -2.0);
+    assert_eq!(bf16_decode(0x4049), 3.140625); // π rounded to bf16
 }
 
 /// FP8 dequant, 2×4 with `block=2`: two column tiles get different scales (×2 then ×1); both rows
